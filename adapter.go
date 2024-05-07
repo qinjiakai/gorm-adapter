@@ -200,8 +200,9 @@ func NewAdapterByDBUseTableName(db *gorm.DB, prefix string, tableName string) (*
 	}
 
 	a := &Adapter{
-		tablePrefix: prefix,
-		tableName:   tableName,
+		tablePrefix:   prefix,
+		tableName:     tableName,
+		transactionMu: &sync.Mutex{},
 	}
 
 	a.db = db.Scopes(a.casbinRuleTable()).Session(&gorm.Session{Context: db.Statement.Context})
@@ -259,9 +260,10 @@ func NewFilteredAdapter(driverName string, dataSourceName string, params ...inte
 // Casbin will not automatically call LoadPolicy() for a filtered adapter.
 func NewFilteredAdapterByDB(db *gorm.DB, prefix string, tableName string) (*Adapter, error) {
 	adapter := &Adapter{
-		tablePrefix: prefix,
-		tableName:   tableName,
-		isFiltered:  true,
+		tablePrefix:   prefix,
+		tableName:     tableName,
+		isFiltered:    true,
+		transactionMu: &sync.Mutex{},
 	}
 	adapter.db = db.Scopes(adapter.casbinRuleTable()).Session(&gorm.Session{Context: db.Statement.Context})
 
@@ -690,15 +692,6 @@ func (a *Adapter) AddPolicies(sec string, ptype string, rules [][]string) error 
 
 // Transaction perform a set of operations within a transaction
 func (a *Adapter) Transaction(e casbin.IEnforcer, fc func(casbin.IEnforcer) error, opts ...*sql.TxOptions) error {
-	// ensure the transactionMu is initialized
-	if a.transactionMu == nil {
-		for a.muInitialize.CompareAndSwap(false, true) {
-			if a.transactionMu == nil {
-				a.transactionMu = &sync.Mutex{}
-			}
-			a.muInitialize.Store(false)
-		}
-	}
 	// lock the transactionMu to ensure the transaction is thread-safe
 	a.transactionMu.Lock()
 	defer a.transactionMu.Unlock()
@@ -706,7 +699,8 @@ func (a *Adapter) Transaction(e casbin.IEnforcer, fc func(casbin.IEnforcer) erro
 	oriAdapter := a.db
 	// reload policy from database to sync with the transaction
 	defer func() {
-		e.SetAdapter(&Adapter{db: oriAdapter})
+		e.SetAdapter(&Adapter{db: oriAdapter, transactionMu: a.transactionMu})
+
 		err = e.LoadPolicy()
 		if err != nil {
 			panic(err)
@@ -714,7 +708,7 @@ func (a *Adapter) Transaction(e casbin.IEnforcer, fc func(casbin.IEnforcer) erro
 	}()
 	copyDB := *a.db
 	tx := copyDB.Begin(opts...)
-	b := &Adapter{db: tx}
+	b := &Adapter{db: tx, transactionMu: a.transactionMu}
 	// copy enforcer to set the new adapter with transaction tx
 	copyEnforcer := e
 	copyEnforcer.SetAdapter(b)
